@@ -5,23 +5,23 @@ from PIL import Image, ImageEnhance
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from model import ResNet50
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_DIR = '/data/ILSVRC2012/train'
-WEIGHTS_FILE = 'resnet50_pretrained.pth'  # pretrained weights to load on first run
+TRAIN_DIR = '/data/ILSVRC2012/train'
+VAL_DIR   = '/data/ILSVRC2012/val'
 CHECKPOINT = None  # set to e.g. 'checkpoint_epoch5.pth' to resume training
-NUM_EPOCHS = 10
+NUM_EPOCHS = 30
 BATCH_SIZE = 64
-LR = 0.001
-WORKERS = 8
-UNFREEZE_LAYER3 = False
+LR = 0.1        # SGD with 0.1 is standard for training ResNet50 from scratch
+WORKERS = 16
 
 # ── Device ────────────────────────────────────────────────────────────────────
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Using device: {device}')
 
 # ── Transforms ────────────────────────────────────────────────────────────────
-class ImageTransform:
+class TrainTransform:
     def __call__(self, img):
         img = self._resize(img, 256)
         if random.random() > 0.5:
@@ -34,7 +34,6 @@ class ImageTransform:
         return self._to_tensor(img)
 
     def _resize(self, img, size):
-        # Resize shortest side to `size`, keep aspect ratio
         w, h = img.size
         if w < h:
             return img.resize((size, int(h * size / w)), Image.BILINEAR)
@@ -52,10 +51,33 @@ class ImageTransform:
         return img
 
     def _to_tensor(self, img):
-        # Convert PIL image to normalized CHW tensor
         arr = np.array(img.convert('RGB'), dtype=np.float32) / 255.0
         arr = (arr - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
         return torch.tensor(arr.transpose(2, 0, 1), dtype=torch.float32)  # HWC -> CHW
+
+
+class ValTransform:
+    # No random augmentations for validation — just resize, crop, normalize
+    def __call__(self, img):
+        img = self._resize(img, 256)
+        img = self._center_crop(img, 224)
+        return self._to_tensor(img)
+
+    def _resize(self, img, size):
+        w, h = img.size
+        if w < h:
+            return img.resize((size, int(h * size / w)), Image.BILINEAR)
+        return img.resize((int(w * size / h), size), Image.BILINEAR)
+
+    def _center_crop(self, img, size):
+        w, h = img.size
+        left, top = (w - size) // 2, (h - size) // 2
+        return img.crop((left, top, left + size, top + size))
+
+    def _to_tensor(self, img):
+        arr = np.array(img.convert('RGB'), dtype=np.float32) / 255.0
+        arr = (arr - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
+        return torch.tensor(arr.transpose(2, 0, 1), dtype=torch.float32)
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -84,101 +106,27 @@ class ImageNetDataset(Dataset):
         return img, label
 
 
-# ── Model ─────────────────────────────────────────────────────────────────────
-class BottleneckBlock(nn.Module):
-    def __init__(self, in_channels, mid_channels, out_channels, stride=1, downsample=None):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid_channels)
-        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(mid_channels)
-        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample  # projection shortcut if dimensions differ
-
-    def forward(self, x):
-        identity = self.downsample(x) if self.downsample else x
-
-        out = self.relu(self.bn1(self.conv1(x)))   # 1x1 reduce
-        out = self.relu(self.bn2(self.conv2(out))) # 3x3 convolve
-        out = self.bn3(self.conv3(out))            # 1x1 expand
-
-        out += identity  # skip connection — adds original input back (the residual)
-        return self.relu(out)
-
-
-class ResNet50(nn.Module):
-    def __init__(self, num_classes=1000):
-        super().__init__()
-        # Stem — takes raw 3-channel image, outputs 64 channels at 1/4 spatial size
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-        # 4 layer groups — channel sizes and block counts come from the paper
-        self.layer1 = self._make_layer(64,   64,  256, blocks=3)
-        self.layer2 = self._make_layer(256, 128,  512, blocks=4, stride=2)
-        self.layer3 = self._make_layer(512, 256, 1024, blocks=6, stride=2)
-        self.layer4 = self._make_layer(1024, 512, 2048, blocks=3, stride=2)
-
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(2048, num_classes)
-
-    def _make_layer(self, in_channels, mid_channels, out_channels, blocks, stride=1):
-        # First block always needs a downsample because channels change
-        downsample = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-            nn.BatchNorm2d(out_channels)
-        )
-        layers = [BottleneckBlock(in_channels, mid_channels, out_channels, stride=stride, downsample=downsample)]
-        # Remaining blocks have matching dimensions so no downsample needed
-        for _ in range(1, blocks):
-            layers.append(BottleneckBlock(out_channels, mid_channels, out_channels))
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        x = torch.flatten(self.avgpool(x), 1)
-        return self.fc(x)
-
-
 # ── Data ──────────────────────────────────────────────────────────────────────
-print(f'Loading dataset from {DATA_DIR}')
-train_dataset = ImageNetDataset(root=DATA_DIR, transform=ImageTransform())
+print(f'Loading train dataset from {TRAIN_DIR}')
+train_dataset = ImageNetDataset(root=TRAIN_DIR, transform=TrainTransform())
 train_loader = DataLoader(
     train_dataset, batch_size=BATCH_SIZE, shuffle=True,
     num_workers=WORKERS,  # parallel CPU workers that load/augment images while the GPU trains
     pin_memory=True       # keeps loaded batches in pinned RAM for faster GPU transfers
 )
 
-# ── Setup model ───────────────────────────────────────────────────────────────
+print(f'Loading val dataset from {VAL_DIR}')
+val_dataset = ImageNetDataset(root=VAL_DIR, transform=ValTransform())
+val_loader = DataLoader(
+    val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+    num_workers=WORKERS, pin_memory=True
+)
+
+# ── Model ─────────────────────────────────────────────────────────────────────
 model = ResNet50()
 
-# Load pretrained weights — weight file key names match our layer names exactly
-if os.path.isfile(WEIGHTS_FILE):
-    print(f'Loading pretrained weights from {WEIGHTS_FILE}')
-    model.load_state_dict(torch.load(WEIGHTS_FILE, map_location='cpu'))
-
-# Freeze all layers — keeps the pretrained weights intact and speeds up training
-# since gradients aren't computed for frozen layers
+# All layers are trainable — no pretrained weights, training from scratch
 for param in model.parameters():
-    param.requires_grad = False
-
-# Unfreeze only the deepest layers so we fine-tune just the high-level features.
-# layer4 is the last convolutional block; fc is the final classifier.
-# Set UNFREEZE_LAYER3 = True in config to also fine-tune the block before layer4.
-if UNFREEZE_LAYER3:
-    for param in model.layer3.parameters():
-        param.requires_grad = True
-for param in model.layer4.parameters():
-    param.requires_grad = True
-for param in model.fc.parameters():
     param.requires_grad = True
 
 model = nn.DataParallel(model)
@@ -186,11 +134,11 @@ model = model.to(device)
 
 # ── Optimizer & loss ──────────────────────────────────────────────────────────
 criterion = nn.CrossEntropyLoss()
-# Only pass unfrozen parameters to the optimizer — no point updating frozen ones
-optimizer = torch.optim.Adam(
-    filter(lambda p: p.requires_grad, model.parameters()),
-    lr=LR
-)
+# SGD + momentum is standard for training ResNet from scratch — Adam tends to
+# generalize worse on ImageNet when starting from random weights
+optimizer = torch.optim.SGD(model.parameters(), lr=LR, momentum=0.9, weight_decay=1e-4)
+# Reduce LR by 10x at epochs 10 and 20 — standard schedule for 30-epoch runs
+scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 20], gamma=0.1)
 
 # ── Resume from checkpoint ────────────────────────────────────────────────────
 # Restores the model weights and optimizer state so training continues exactly
@@ -201,12 +149,15 @@ if CHECKPOINT and os.path.isfile(CHECKPOINT):
     ckpt = torch.load(CHECKPOINT, map_location=device)
     model.load_state_dict(ckpt['model_state_dict'])
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
     start_epoch = ckpt['epoch']
-    print(f'Resumed at epoch {start_epoch}, loss {ckpt["loss"]:.4f}')
+    print(f'Resumed at epoch {start_epoch}, loss {ckpt["loss"]:.4f}, val acc {ckpt["val_acc"]:.2f}%')
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 print(f'Training from epoch {start_epoch + 1} to {start_epoch + NUM_EPOCHS}')
 for epoch in range(start_epoch, start_epoch + NUM_EPOCHS):
+
+    # ── Train ─────────────────────────────────────────────────────────────────
     model.train()
     running_loss = 0.0
 
@@ -227,14 +178,33 @@ for epoch in range(start_epoch, start_epoch + NUM_EPOCHS):
             running_loss = 0.0
 
     epoch_loss = loss.item()
-    print(f'Epoch {epoch + 1} done. Loss: {epoch_loss:.4f}')
+    scheduler.step()  # decay LR at epochs 10 and 20
 
-    # Save model + optimizer state after each epoch so training can be resumed later
+    # ── Validate ──────────────────────────────────────────────────────────────
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():  # no gradients needed during validation — saves memory and time
+        for inputs, labels in val_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = model(inputs)
+            predicted = outputs.argmax(dim=1)
+            correct += (predicted == labels).sum().item()
+            total += labels.size(0)
+
+    val_acc = 100 * correct / total
+    print(f'Epoch {epoch + 1} done. Loss: {epoch_loss:.4f} | Val Acc: {val_acc:.2f}%')
+
+    # Save model + optimizer + scheduler state so training can be resumed later
     torch.save({
         'epoch': epoch + 1,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
         'loss': epoch_loss,
+        'val_acc': val_acc,
     }, f'checkpoint_epoch{epoch + 1}.pth')
     print(f'Saved checkpoint_epoch{epoch + 1}.pth')
 
